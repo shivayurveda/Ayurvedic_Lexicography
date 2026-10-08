@@ -1,0 +1,55 @@
+from pathlib import Path
+import pandas as pd
+
+print("=" * 80)
+print("FINDING DATASETS FOR CV RECONSTRUCTION")
+print("=" * 80)
+
+files = []
+
+for root in [
+    Path("/content"),
+    Path("/content/data"),
+    Path("/content/AYURPADAVAALI_FINAL_EVALUATION")
+]:
+    if root.exists():
+        for p in root.rglob("*"):
+            if p.is_file() and p.suffix.lower() in [".csv", ".xlsx", ".xls"]:
+                files.append(p)
+
+files = sorted(set(files))
+
+for i, p in enumerate(files, 1):
+
+    try:
+        if p.suffix.lower() == ".csv":
+            df = pd.read_csv(p)
+        else:
+            df = pd.read_excel(p)
+
+        print(f"\n[{i}] {p}")
+        print("    Shape:", df.shape)
+        print("    Columns:", list(df.columns))
+
+        # Show possible target columns
+        possible_targets = []
+
+        for c in df.columns:
+            nunique = df[c].nunique(dropna=True)
+
+            if 2 <= nunique <= 10:
+                possible_targets.append(
+                    (c, nunique)
+                )
+
+        if possible_targets:
+            print("    Possible target columns:",
+                  possible_targets[:15])
+
+    except Exception as e:
+        print(f"\n[{i}] {p}")
+        print("    Could not read:", str(e)[:150])
+
+print("\n" + "=" * 80)
+print("END")
+print("=" * 80)

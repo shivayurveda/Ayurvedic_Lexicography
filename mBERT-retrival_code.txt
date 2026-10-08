@@ -1,0 +1,1615 @@
+# =============================================================================
+# NIGHANTU RETRIEVAL EVALUATION
+# Exact vs Levenshtein vs mBERT vs Hybrid
+#
+# Colab-ready
+#
+# INPUT FILES:
+#   Bhavaprakashanighantu  (1).xlsx
+#   Dhanavantarinighantu (1).xlsx
+#   Rajnighantu (1).xlsx
+#   Three_Nighantu_OCR_Benchmark_Verified (2).xlsx
+#
+# OUTPUT:
+#   nighantu_retrieval_results.xlsx
+#
+# Evaluation:
+#   - Exact matching
+#   - Levenshtein similarity
+#   - mBERT cosine similarity
+#   - Hybrid score
+#   - Hit@1, Hit@3, Hit@5, Hit@10
+#   - Hit@50% of entries
+#   - MRR
+#   - Mean rank
+#   - Median rank
+#
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 0. INSTALL PACKAGES
+# -----------------------------------------------------------------------------
+
+!pip -q install rapidfuzz transformers torch openpyxl pandas numpy
+
+
+# -----------------------------------------------------------------------------
+# 1. IMPORTS
+# -----------------------------------------------------------------------------
+
+import os
+import re
+import random
+import unicodedata
+import collections
+import warnings
+import difflib
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+
+# -----------------------------------------------------------------------------
+# 2. CONFIGURATION
+# -----------------------------------------------------------------------------
+
+CONFIG = dict(
+
+    # -------------------------------------------------------------------------
+    # Your actual uploaded files
+    # -------------------------------------------------------------------------
+    DATA_FILES = {
+        "Bhavaprakasha": "Bhavaprakashanighantu  (1).xlsx",
+        "Dhanvantari":   "Dhanavantarinighantu (1).xlsx",
+        "Rajanighantu":  "Rajnighantu (1).xlsx",
+    },
+
+    # -------------------------------------------------------------------------
+    # Leave these as None.
+    # The code automatically detects the columns.
+    # -------------------------------------------------------------------------
+    HEADWORD_COL = None,
+    SYNONYM_COL  = None,
+
+    # -------------------------------------------------------------------------
+    # Your verified OCR benchmark
+    # -------------------------------------------------------------------------
+    BENCHMARK_FILE = "Three_Nighantu_OCR_Benchmark_Verified (2).xlsx",
+
+    # -------------------------------------------------------------------------
+    # Number of queries per Nighantu
+    # Approximately half headwords and half synonyms
+    # -------------------------------------------------------------------------
+    N_QUERIES = 200,
+
+    # -------------------------------------------------------------------------
+    # Simulated OCR character error rates
+    # -------------------------------------------------------------------------
+    NOISE_LEVELS = [0.0, 0.05, 0.10, 0.20, 0.30],
+
+    # -------------------------------------------------------------------------
+    # Hybrid score
+    #
+    # Hybrid =
+    #   ALPHA * Levenshtein
+    #   +
+    #   (1-ALPHA) * mBERT
+    # -------------------------------------------------------------------------
+    ALPHA = 0.5,
+
+    # -------------------------------------------------------------------------
+    # Retrieval cutoffs
+    # -------------------------------------------------------------------------
+    CUTOFFS = [1, 3, 5, 10],
+
+    # Hit@50% of database entries
+    FRACTION_CUTOFFS = [0.5],
+
+    # -------------------------------------------------------------------------
+    # Reproducibility
+    # -------------------------------------------------------------------------
+    SEED = 42,
+
+    # -------------------------------------------------------------------------
+    # mBERT
+    # -------------------------------------------------------------------------
+    USE_MBERT = True,
+    MBERT_MODEL = "bert-base-multilingual-cased",
+
+    # -------------------------------------------------------------------------
+    # Output
+    # -------------------------------------------------------------------------
+    OUT_FILE = "nighantu_retrieval_results.xlsx",
+)
+
+
+random.seed(CONFIG["SEED"])
+np.random.seed(CONFIG["SEED"])
+
+
+# -----------------------------------------------------------------------------
+# 3. DEVANAGARI / TEXT NORMALISATION
+# -----------------------------------------------------------------------------
+
+DEV = re.compile(r"[\u0900-\u097F]")
+
+
+def norm(s):
+    """
+    Basic Unicode/text normalization.
+    """
+    s = unicodedata.normalize("NFC", str(s))
+
+    # Remove zero-width characters
+    s = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", s)
+
+    # Remove punctuation, digits and danda
+    s = re.sub(
+        r"[\u0964\u0965|0-9\u0966-\u096F.,;:()\[\]'\"*]",
+        " ",
+        s
+    )
+
+    # Normalize whitespace
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def devanagari_only(s):
+    """
+    Keep Devanagari characters only.
+    """
+    return "".join(
+        ch
+        for ch in unicodedata.normalize("NFC", str(s))
+        if "\u0900" <= ch <= "\u097F"
+        and ch not in "\u0964\u0965"
+    )
+
+
+# -----------------------------------------------------------------------------
+# 4. COLUMN DETECTION
+# -----------------------------------------------------------------------------
+
+HEAD_HINTS = [
+    "headword",
+    "head word",
+    "sanskrit name",
+    "name",
+    "dravya",
+    "word",
+    "term",
+    "nama",
+    "नाम",
+    "शब्द"
+]
+
+SYN_HINTS = [
+    "synonym",
+    "paryaya",
+    "paryāya",
+    "पर्याय",
+    "alias",
+    "other names",
+    "etymology"
+]
+
+
+def pick_col(cols, hints, exclude=()):
+    """
+    Find a column by matching likely header names.
+    """
+
+    low = {
+        c: str(c).lower().strip()
+        for c in cols
+        if c not in exclude
+    }
+
+    for h in hints:
+        for c, l in low.items():
+            if h.lower() in l:
+                return c
+
+    return None
+
+
+# -----------------------------------------------------------------------------
+# 5. LOAD NIGHANTU WORKBOOK
+# -----------------------------------------------------------------------------
+
+def load_nighantu(name, path):
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"[{name}] File not found: {path}"
+        )
+
+    print("\n" + "=" * 80)
+    print(f"Loading {name}")
+    print(f"File: {path}")
+    print("=" * 80)
+
+    xl = pd.ExcelFile(path)
+
+    print(f"Number of sheets: {len(xl.sheet_names)}")
+
+    entries = []
+
+    # -------------------------------------------------------------------------
+    # Scan every sheet
+    #
+    # This is important because:
+    # - Bhavaprakasha has normal headers
+    # - Dhanvantari has normal headers
+    # - Rajanighantu has the structured header below the title row
+    # -------------------------------------------------------------------------
+
+    for sheet in xl.sheet_names:
+
+        try:
+            raw = pd.read_excel(
+                path,
+                sheet_name=sheet,
+                header=None
+            )
+        except Exception as e:
+            print(f"Could not read sheet '{sheet}': {e}")
+            continue
+
+        if raw.empty:
+            continue
+
+        # ---------------------------------------------------------------------
+        # Find a row containing "Head Word" / "Head word"
+        # ---------------------------------------------------------------------
+
+        header_row = None
+
+        max_scan = min(len(raw), 40)
+
+        for i in range(max_scan):
+
+            vals = [
+                str(v).strip().lower()
+                for v in raw.iloc[i].tolist()
+            ]
+
+            if any(
+                v in ["head word", "headword"]
+                for v in vals
+            ):
+                header_row = i
+                break
+
+        # ---------------------------------------------------------------------
+        # If no structured header was found, skip this sheet
+        # ---------------------------------------------------------------------
+
+        if header_row is None:
+            continue
+
+        # ---------------------------------------------------------------------
+        # Construct dataframe using the detected header row
+        # ---------------------------------------------------------------------
+
+        df = raw.iloc[header_row + 1:].copy()
+
+        headers = [
+            str(x).strip()
+            for x in raw.iloc[header_row].tolist()
+        ]
+
+        df.columns = headers
+
+        # Remove completely empty columns
+        df = df.dropna(axis=1, how="all")
+
+        # ---------------------------------------------------------------------
+        # Detect headword and synonym columns
+        # ---------------------------------------------------------------------
+
+        hc = CONFIG["HEADWORD_COL"]
+
+        if hc is None:
+            hc = pick_col(
+                df.columns,
+                HEAD_HINTS
+            )
+
+        sc = CONFIG["SYNONYM_COL"]
+
+        if sc is None:
+            sc = pick_col(
+                df.columns,
+                SYN_HINTS,
+                exclude=[hc]
+            )
+
+        # ---------------------------------------------------------------------
+        # Make sure headword column exists
+        # ---------------------------------------------------------------------
+
+        if hc is None:
+
+            print(
+                f"[{name}] Skipping sheet '{sheet}' "
+                f"(Head Word column not detected)"
+            )
+
+            continue
+
+        print(
+            f"[{name}] sheet='{sheet}' "
+            f"header_row={header_row} "
+            f"rows={len(df)} "
+            f"headword='{hc}' "
+            f"synonym='{sc}'"
+        )
+
+        # ---------------------------------------------------------------------
+        # Extract entries
+        # ---------------------------------------------------------------------
+
+        for _, r in df.iterrows():
+
+            if hc not in r:
+                continue
+
+            if pd.isna(r[hc]):
+                continue
+
+            h = norm(r[hc])
+
+            # Only retain Sanskrit/Devanagari headwords
+            if not h:
+                continue
+
+            if not DEV.search(h):
+                continue
+
+            # -----------------------------------------------------------------
+            # Synonyms
+            # -----------------------------------------------------------------
+
+            syns = []
+
+            if (
+                sc is not None
+                and sc in r
+                and pd.notna(r[sc])
+            ):
+
+                raw_syns = re.split(
+                    r"[,;/|\n]+",
+                    str(r[sc])
+                )
+
+                for x in raw_syns:
+
+                    x = norm(x)
+
+                    if (
+                        x
+                        and DEV.search(x)
+                        and x != h
+                    ):
+                        syns.append(x)
+
+            entries.append(
+                (h, syns)
+            )
+
+    # -------------------------------------------------------------------------
+    # Remove exact duplicate entries
+    # -------------------------------------------------------------------------
+
+    unique_entries = []
+
+    seen = set()
+
+    for h, syns in entries:
+
+        key = (
+            h,
+            tuple(sorted(set(syns)))
+        )
+
+        if key not in seen:
+
+            seen.add(key)
+
+            unique_entries.append(
+                (h, sorted(set(syns)))
+            )
+
+    entries = unique_entries
+
+    # -------------------------------------------------------------------------
+    # Final report
+    # -------------------------------------------------------------------------
+
+    print(
+        f"\n[{name}] TOTAL usable entries = {len(entries)}"
+    )
+
+    if len(entries) == 0:
+
+        raise ValueError(
+            f"[{name}] No usable Sanskrit entries were found."
+        )
+
+    return entries
+
+
+# -----------------------------------------------------------------------------
+# 6. BUILD TERM INDEX
+# -----------------------------------------------------------------------------
+
+def build_index(entries):
+
+    # term -> entry IDs
+    term2entries = collections.defaultdict(set)
+
+    for i, (h, syns) in enumerate(entries):
+
+        term2entries[h].add(i)
+
+        for s in syns:
+            term2entries[s].add(i)
+
+    terms = sorted(term2entries)
+
+    return terms, term2entries
+
+
+# -----------------------------------------------------------------------------
+# 7. LEARN OCR CONFUSIONS FROM VERIFIED BENCHMARK
+# -----------------------------------------------------------------------------
+
+def learn_confusions(bench_file):
+
+    subs = collections.Counter()
+    dels = collections.Counter()
+    inss = collections.Counter()
+
+    print("\n" + "=" * 80)
+    print("OCR CONFUSION LEARNING")
+    print("=" * 80)
+
+    if not bench_file or not os.path.exists(bench_file):
+
+        print(
+            "WARNING: Benchmark file not found."
+        )
+
+        print(
+            "Generic Devanagari noise will be used."
+        )
+
+        return subs, dels, inss
+
+    # -------------------------------------------------------------------------
+    # Read verified OCR benchmark
+    # -------------------------------------------------------------------------
+
+    b = pd.read_excel(
+        bench_file,
+        sheet_name="OCR Benchmark"
+    )
+
+    print(
+        f"Benchmark rows loaded: {len(b)}"
+    )
+
+    # -------------------------------------------------------------------------
+    # Verify expected columns
+    # -------------------------------------------------------------------------
+
+    required = [
+        "Verification_Status",
+        "Corrected_Text_Ground_Truth",
+        "OCR_Text"
+    ]
+
+    missing = [
+        c for c in required
+        if c not in b.columns
+    ]
+
+    if missing:
+
+        raise ValueError(
+            "Benchmark is missing columns: "
+            + str(missing)
+        )
+
+    # -------------------------------------------------------------------------
+    # Keep verified passages only
+    # -------------------------------------------------------------------------
+
+    b = b[
+        b["Verification_Status"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        == "verified"
+    ]
+
+    print(
+        f"Verified passages used: {len(b)}"
+    )
+
+    # -------------------------------------------------------------------------
+    # Compare ground truth and OCR
+    # -------------------------------------------------------------------------
+
+    for _, r in b.iterrows():
+
+        gt = devanagari_only(
+            r["Corrected_Text_Ground_Truth"]
+        )
+
+        oc = devanagari_only(
+            r["OCR_Text"]
+        )
+
+        if not gt or not oc:
+            continue
+
+        sm = difflib.SequenceMatcher(
+            None,
+            gt,
+            oc,
+            autojunk=False
+        )
+
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+
+            # -------------------------------------------------------------
+            # Replacement
+            # -------------------------------------------------------------
+
+            if tag == "replace":
+
+                if (i2 - i1) == (j2 - j1):
+
+                    for a, c in zip(
+                        gt[i1:i2],
+                        oc[j1:j2]
+                    ):
+                        subs[(a, c)] += 1
+
+                else:
+
+                    for a in gt[i1:i2]:
+                        dels[a] += 1
+
+                    for c in oc[j1:j2]:
+                        inss[c] += 1
+
+            # -------------------------------------------------------------
+            # Deletion
+            # -------------------------------------------------------------
+
+            elif tag == "delete":
+
+                for a in gt[i1:i2]:
+                    dels[a] += 1
+
+            # -------------------------------------------------------------
+            # Insertion
+            # -------------------------------------------------------------
+
+            elif tag == "insert":
+
+                for c in oc[j1:j2]:
+                    inss[c] += 1
+
+    print(
+        f"Learned substitutions: {sum(subs.values())}"
+    )
+
+    print(
+        f"Learned deletions:     {sum(dels.values())}"
+    )
+
+    print(
+        f"Learned insertions:    {sum(inss.values())}"
+    )
+
+    return subs, dels, inss
+
+
+# -----------------------------------------------------------------------------
+# 8. INITIAL OCR CONFUSION MODEL
+# -----------------------------------------------------------------------------
+
+SUBS, DELS, INSS = learn_confusions(
+    CONFIG["BENCHMARK_FILE"]
+)
+
+SUB_MAP = collections.defaultdict(list)
+
+for (a, c), n in SUBS.items():
+
+    SUB_MAP[a] += [c] * n
+
+
+# Generic Devanagari character pool
+ALL_CHARS = (
+    [chr(c) for c in range(0x0915, 0x0939)]
+    + list("ािीुूेैोौं्ँः")
+)
+
+
+INS_POOL = [
+    c
+    for c, n in INSS.items()
+    for _ in range(n)
+] or ALL_CHARS
+
+
+tot = (
+    sum(SUBS.values())
+    + sum(DELS.values())
+    + sum(INSS.values())
+)
+
+
+if tot:
+
+    P_SUB = sum(SUBS.values()) / tot
+    P_DEL = sum(DELS.values()) / tot
+
+else:
+
+    P_SUB = 0.5
+    P_DEL = 0.3
+
+
+# -----------------------------------------------------------------------------
+# 9. ADD OCR-LIKE CHARACTER NOISE
+# -----------------------------------------------------------------------------
+
+def add_noise(s, p, rng):
+
+    if p == 0:
+        return s
+
+    out = []
+
+    for ch in s:
+
+        # Keep spaces unchanged
+        if ch == " ":
+
+            out.append(ch)
+            continue
+
+        # No error for this character
+        if rng.random() >= p:
+
+            out.append(ch)
+            continue
+
+        # Determine error type
+        u = rng.random()
+
+        # -------------------------------------------------------------
+        # SUBSTITUTION
+        # -------------------------------------------------------------
+
+        if u < P_SUB:
+
+            if SUB_MAP.get(ch):
+
+                out.append(
+                    rng.choice(SUB_MAP[ch])
+                )
+
+            else:
+
+                out.append(
+                    rng.choice(ALL_CHARS)
+                )
+
+        # -------------------------------------------------------------
+        # DELETION
+        # -------------------------------------------------------------
+
+        elif u < P_SUB + P_DEL:
+
+            pass
+
+        # -------------------------------------------------------------
+        # INSERTION
+        # -------------------------------------------------------------
+
+        else:
+
+            out.append(ch)
+
+            out.append(
+                rng.choice(INS_POOL)
+            )
+
+    r = "".join(out).strip()
+
+    return r if r else s
+
+
+# -----------------------------------------------------------------------------
+# 10. LEVENSHTEIN SCORER
+# -----------------------------------------------------------------------------
+
+from rapidfuzz import process, distance
+
+
+def lev_matrix(queries, terms):
+
+    return process.cdist(
+        queries,
+        terms,
+        scorer=distance.Levenshtein.normalized_similarity,
+        dtype=np.float32,
+        workers=-1
+    )
+
+
+# -----------------------------------------------------------------------------
+# 11. EXACT MATCH SCORER
+# -----------------------------------------------------------------------------
+
+def exact_matrix(queries, terms):
+
+    idx = {
+        t: i
+        for i, t in enumerate(terms)
+    }
+
+    M = np.zeros(
+        (len(queries), len(terms)),
+        np.float32
+    )
+
+    for qi, q in enumerate(queries):
+
+        if q in idx:
+
+            M[qi, idx[q]] = 1.0
+
+    return M
+
+
+# -----------------------------------------------------------------------------
+# 12. mBERT MODEL
+# -----------------------------------------------------------------------------
+
+_tok = None
+_mdl = None
+
+
+def embed(texts, bs=64):
+
+    import torch
+
+    global _tok, _mdl
+
+    # -------------------------------------------------------------------------
+    # Load model only once
+    # -------------------------------------------------------------------------
+
+    if _mdl is None:
+
+        from transformers import (
+            AutoTokenizer,
+            AutoModel
+        )
+
+        dev = (
+            "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+
+        print("\n" + "=" * 80)
+        print("Loading mBERT")
+        print("=" * 80)
+
+        print(
+            f"Model: {CONFIG['MBERT_MODEL']}"
+        )
+
+        print(
+            f"Device: {dev}"
+        )
+
+        _tok = AutoTokenizer.from_pretrained(
+            CONFIG["MBERT_MODEL"]
+        )
+
+        _mdl = AutoModel.from_pretrained(
+            CONFIG["MBERT_MODEL"]
+        ).to(dev).eval()
+
+        print("mBERT loaded successfully.")
+
+    dev = next(
+        _mdl.parameters()
+    ).device
+
+    vecs = []
+
+    # -------------------------------------------------------------------------
+    # Generate embeddings
+    # -------------------------------------------------------------------------
+
+    with torch.no_grad():
+
+        for i in range(
+            0,
+            len(texts),
+            bs
+        ):
+
+            batch = texts[
+                i:i + bs
+            ]
+
+            enc = _tok(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=32,
+                return_tensors="pt"
+            ).to(dev)
+
+            h = _mdl(
+                **enc
+            ).last_hidden_state
+
+            # Attention-mask mean pooling
+            m = (
+                enc["attention_mask"]
+                .unsqueeze(-1)
+                .float()
+            )
+
+            v = (
+                (h * m).sum(1)
+                / m.sum(1)
+            )
+
+            # L2 normalize
+            v = torch.nn.functional.normalize(
+                v,
+                dim=1
+            )
+
+            vecs.append(
+                v.cpu().numpy()
+            )
+
+    return np.vstack(vecs)
+
+
+# -----------------------------------------------------------------------------
+# 13. RANK OF GOLD ENTRY
+# -----------------------------------------------------------------------------
+
+def rank_of_gold(
+    score_row,
+    terms,
+    term2entries,
+    gold_set
+):
+
+    """
+    Full ranking.
+
+    The rank is assigned to database entries,
+    not merely lexical terms.
+
+    If several terms point to the same entry,
+    that entry is counted only once.
+    """
+
+    order = np.argsort(
+        -score_row,
+        kind="stable"
+    )
+
+    seen = set()
+    r = 0
+
+    for ti in order:
+
+        for e in sorted(
+            term2entries[terms[ti]]
+        ):
+
+            if e not in seen:
+
+                seen.add(e)
+
+                r += 1
+
+                if e in gold_set:
+
+                    return r
+
+    return None
+
+
+# -----------------------------------------------------------------------------
+# 14. EVALUATE ONE NIGHANTU
+# -----------------------------------------------------------------------------
+
+def evaluate(name, entries):
+
+    print("\n" + "#" * 80)
+    print(f"EVALUATING: {name}")
+    print("#" * 80)
+
+    terms, term2entries = build_index(
+        entries
+    )
+
+    rng = random.Random(
+        CONFIG["SEED"]
+    )
+
+    # -------------------------------------------------------------------------
+    # Headwords
+    # -------------------------------------------------------------------------
+
+    heads = sorted({
+        h
+        for h, _ in entries
+    })
+
+    head_set = set(heads)
+
+    # -------------------------------------------------------------------------
+    # Synonyms
+    # -------------------------------------------------------------------------
+
+    syns = sorted({
+        s
+        for _, ss in entries
+        for s in ss
+    })
+
+    # -------------------------------------------------------------------------
+    # Query count
+    # -------------------------------------------------------------------------
+
+    n = CONFIG["N_QUERIES"]
+
+    if syns:
+
+        nh = n // 2
+
+    else:
+
+        nh = n
+
+    # -------------------------------------------------------------------------
+    # Sample headword queries
+    # -------------------------------------------------------------------------
+
+    n_heads = min(
+        nh,
+        len(heads)
+    )
+
+    gold_terms = rng.sample(
+        heads,
+        n_heads
+    )
+
+    # -------------------------------------------------------------------------
+    # Sample synonym queries
+    # -------------------------------------------------------------------------
+
+    remaining = n - len(gold_terms)
+
+    if syns and remaining > 0:
+
+        n_syns = min(
+            remaining,
+            len(syns)
+        )
+
+        gold_terms += rng.sample(
+            syns,
+            n_syns
+        )
+
+    # -------------------------------------------------------------------------
+    # Query types
+    # -------------------------------------------------------------------------
+
+    kinds = [
+        "headword"
+        if t in head_set
+        else "synonym"
+        for t in gold_terms
+    ]
+
+    print(
+        f"Vocabulary terms: {len(terms)}"
+    )
+
+    print(
+        f"Database entries: {len(entries)}"
+    )
+
+    print(
+        f"Headword queries: {sum(k == 'headword' for k in kinds)}"
+    )
+
+    print(
+        f"Synonym queries: {sum(k == 'synonym' for k in kinds)}"
+    )
+
+    # -------------------------------------------------------------------------
+    # Compute database mBERT embeddings once
+    # -------------------------------------------------------------------------
+
+    if CONFIG["USE_MBERT"]:
+
+        print(
+            "\nGenerating mBERT embeddings for database terms..."
+        )
+
+        term_emb = embed(
+            terms
+        )
+
+    else:
+
+        term_emb = None
+
+    # -------------------------------------------------------------------------
+    # Methods
+    # -------------------------------------------------------------------------
+
+    methods = [
+        "Exact",
+        "Levenshtein"
+    ]
+
+    if CONFIG["USE_MBERT"]:
+
+        methods += [
+            "mBERT",
+            "Hybrid"
+        ]
+
+    qrows = []
+
+    # -------------------------------------------------------------------------
+    # Evaluate each noise level
+    # -------------------------------------------------------------------------
+
+    for p in CONFIG["NOISE_LEVELS"]:
+
+        print("\n" + "-" * 80)
+
+        print(
+            f"{name}: OCR character error rate = {p:.0%}"
+        )
+
+        print("-" * 80)
+
+        nrng = random.Random(
+            CONFIG["SEED"]
+            + int(p * 1000)
+        )
+
+        # -------------------------------------------------------------
+        # Generate noisy queries
+        # -------------------------------------------------------------
+
+        noisy = [
+            add_noise(
+                t,
+                p,
+                nrng
+            )
+            for t in gold_terms
+        ]
+
+        # -------------------------------------------------------------
+        # Gold entry sets
+        # -------------------------------------------------------------
+
+        gold_sets = [
+            term2entries[t]
+            for t in gold_terms
+        ]
+
+        # -------------------------------------------------------------
+        # Exact
+        # -------------------------------------------------------------
+
+        S = {}
+
+        S["Exact"] = exact_matrix(
+            noisy,
+            terms
+        )
+
+        # -------------------------------------------------------------
+        # Levenshtein
+        # -------------------------------------------------------------
+
+        print("Calculating Levenshtein scores...")
+
+        S["Levenshtein"] = lev_matrix(
+            noisy,
+            terms
+        )
+
+        # -------------------------------------------------------------
+        # mBERT
+        # -------------------------------------------------------------
+
+        if CONFIG["USE_MBERT"]:
+
+            print("Calculating mBERT scores...")
+
+            query_emb = embed(
+                noisy
+            )
+
+            S["mBERT"] = (
+                query_emb
+                @ term_emb.T
+            )
+
+            # -------------------------------------------------------------
+            # Hybrid
+            # -------------------------------------------------------------
+
+            S["Hybrid"] = (
+                CONFIG["ALPHA"]
+                * S["Levenshtein"]
+                +
+                (1 - CONFIG["ALPHA"])
+                * S["mBERT"]
+            )
+
+        # -------------------------------------------------------------
+        # Rank every query
+        # -------------------------------------------------------------
+
+        for m in methods:
+
+            print(
+                f"Ranking method: {m}"
+            )
+
+            for qi in range(
+                len(noisy)
+            ):
+
+                pos = rank_of_gold(
+                    S[m][qi],
+                    terms,
+                    term2entries,
+                    gold_sets[qi]
+                )
+
+                qrows.append(
+                    (
+                        name,
+                        p,
+                        m,
+                        gold_terms[qi],
+                        kinds[qi],
+                        noisy[qi],
+                        pos,
+                        len(entries)
+                    )
+                )
+
+    return qrows
+
+
+# -----------------------------------------------------------------------------
+# 15. SUMMARY FUNCTION
+# -----------------------------------------------------------------------------
+
+def summarise(g):
+
+    r = (
+        g["Rank_of_gold_entry"]
+        .astype(float)
+    )
+
+    out = {
+        "Queries": len(g)
+    }
+
+    # -------------------------------------------------------------------------
+    # Hit@k
+    # -------------------------------------------------------------------------
+
+    for k in CONFIG["CUTOFFS"]:
+
+        out[
+            f"Hit@{k} %"
+        ] = round(
+            100 * (r <= k).mean(),
+            1
+        )
+
+    # -------------------------------------------------------------------------
+    # Hit@50% of database entries
+    # -------------------------------------------------------------------------
+
+    for f in CONFIG["FRACTION_CUTOFFS"]:
+
+        cutoff = np.ceil(
+            f * g["Entries_in_db"]
+        )
+
+        out[
+            f"Hit@{int(f * 100)}% of entries %"
+        ] = round(
+            100 * (r <= cutoff).mean(),
+            1
+        )
+
+    # -------------------------------------------------------------------------
+    # Mean Reciprocal Rank
+    # -------------------------------------------------------------------------
+
+    out[
+        "MRR (full ranking)"
+    ] = round(
+        (1 / r).mean(),
+        3
+    )
+
+    # -------------------------------------------------------------------------
+    # Mean rank
+    # -------------------------------------------------------------------------
+
+    out[
+        "Mean rank"
+    ] = round(
+        r.mean(),
+        1
+    )
+
+    # -------------------------------------------------------------------------
+    # Median rank
+    # -------------------------------------------------------------------------
+
+    out[
+        "Median rank"
+    ] = float(
+        r.median()
+    )
+
+    return pd.Series(out)
+
+
+# -----------------------------------------------------------------------------
+# 16. CHECK ALL FILES BEFORE RUNNING
+# -----------------------------------------------------------------------------
+
+print("\n" + "=" * 80)
+print("CHECKING INPUT FILES")
+print("=" * 80)
+
+all_required = (
+    list(CONFIG["DATA_FILES"].values())
+    + [CONFIG["BENCHMARK_FILE"]]
+)
+
+missing = []
+
+for f in all_required:
+
+    if os.path.exists(f):
+
+        print(
+            f"OK   : {f}"
+        )
+
+    else:
+
+        print(
+            f"MISS : {f}"
+        )
+
+        missing.append(f)
+
+
+if missing:
+
+    raise FileNotFoundError(
+        "The following required files are missing:\n"
+        + "\n".join(missing)
+    )
+
+
+print(
+    "\nAll required files are present."
+)
+
+
+# -----------------------------------------------------------------------------
+# 17. LEARN OCR CONFUSIONS
+# -----------------------------------------------------------------------------
+
+SUBS, DELS, INSS = learn_confusions(
+    CONFIG["BENCHMARK_FILE"]
+)
+
+# Rebuild substitution map
+SUB_MAP.clear()
+
+for (a, c), n_ in SUBS.items():
+
+    SUB_MAP[a] += [c] * n_
+
+
+# Rebuild insertion pool
+INS_POOL[:] = (
+    [
+        c
+        for c, n_ in INSS.items()
+        for _ in range(n_)
+    ]
+    or ALL_CHARS
+)
+
+
+tot = (
+    sum(SUBS.values())
+    + sum(DELS.values())
+    + sum(INSS.values())
+)
+
+
+if tot:
+
+    P_SUB = (
+        sum(SUBS.values())
+        / tot
+    )
+
+    P_DEL = (
+        sum(DELS.values())
+        / tot
+    )
+
+
+print("\nOCR noise model:")
+print(
+    f"P_SUB = {P_SUB:.4f}"
+)
+print(
+    f"P_DEL = {P_DEL:.4f}"
+)
+print(
+    f"P_INS = {1 - P_SUB - P_DEL:.4f}"
+)
+
+
+# -----------------------------------------------------------------------------
+# 18. RUN EVALUATION
+# -----------------------------------------------------------------------------
+
+all_q = []
+
+for name, path in CONFIG["DATA_FILES"].items():
+
+    entries = load_nighantu(
+        name,
+        path
+    )
+
+    all_q += evaluate(
+        name,
+        entries
+    )
+
+
+# -----------------------------------------------------------------------------
+# 19. QUERY-LEVEL DATAFRAME
+# -----------------------------------------------------------------------------
+
+qdf = pd.DataFrame(
+    all_q,
+    columns=[
+        "Nighantu",
+        "Char_error_rate",
+        "Method",
+        "Gold_term",
+        "Gold_type",
+        "Noisy_query",
+        "Rank_of_gold_entry",
+        "Entries_in_db"
+    ]
+)
+
+
+# -----------------------------------------------------------------------------
+# 20. REMOVE ANY UNRANKED QUERIES
+# -----------------------------------------------------------------------------
+
+qdf["Rank_of_gold_entry"] = pd.to_numeric(
+    qdf["Rank_of_gold_entry"],
+    errors="coerce"
+)
+
+print("\n" + "=" * 80)
+print("QUERY RESULTS")
+print("=" * 80)
+
+print(
+    f"Total query-method rows: {len(qdf)}"
+)
+
+print(
+    f"Unranked rows: "
+    f"{qdf['Rank_of_gold_entry'].isna().sum()}"
+)
+
+
+# -----------------------------------------------------------------------------
+# 21. PER-NIGHANTU SUMMARY
+# -----------------------------------------------------------------------------
+
+res = (
+    qdf
+    .groupby(
+        [
+            "Nighantu",
+            "Char_error_rate",
+            "Method"
+        ],
+        dropna=False
+    )
+    .apply(
+        summarise,
+        include_groups=False
+    )
+    .reset_index()
+)
+
+
+# -----------------------------------------------------------------------------
+# 22. POOLED SUMMARY
+# -----------------------------------------------------------------------------
+
+pooled = (
+    qdf
+    .groupby(
+        [
+            "Char_error_rate",
+            "Method"
+        ],
+        dropna=False
+    )
+    .apply(
+        summarise,
+        include_groups=False
+    )
+    .reset_index()
+)
+
+
+# -----------------------------------------------------------------------------
+# 23. PRINT MAIN RESULT: POOLED HIT@1
+# -----------------------------------------------------------------------------
+
+print("\n" + "=" * 80)
+print("POOLED Hit@1 (%)")
+print("=" * 80)
+
+print(
+    pooled.pivot(
+        index="Char_error_rate",
+        columns="Method",
+        values="Hit@1 %"
+    )
+)
+
+
+# -----------------------------------------------------------------------------
+# 24. PRINT POOLED SUMMARY
+# -----------------------------------------------------------------------------
+
+print("\n" + "=" * 80)
+print("POOLED SUMMARY")
+print("=" * 80)
+
+print(
+    pooled.to_string(index=False)
+)
+
+
+# -----------------------------------------------------------------------------
+# 25. SAVE EXCEL RESULTS
+# -----------------------------------------------------------------------------
+
+with pd.ExcelWriter(
+    CONFIG["OUT_FILE"],
+    engine="openpyxl"
+) as xw:
+
+    pooled.to_excel(
+        xw,
+        sheet_name="Pooled_summary",
+        index=False
+    )
+
+    res.to_excel(
+        xw,
+        sheet_name="Per_nighantu",
+        index=False
+    )
+
+    qdf.to_excel(
+        xw,
+        sheet_name="Query_level",
+        index=False
+    )
+
+    # Settings
+    settings_df = pd.DataFrame({
+        "Setting": list(CONFIG.keys()),
+        "Value": [
+            str(v)
+            for v in CONFIG.values()
+        ]
+    })
+
+    settings_df.to_excel(
+        xw,
+        sheet_name="Settings",
+        index=False
+    )
+
+
+# -----------------------------------------------------------------------------
+# 26. FINAL MESSAGE
+# -----------------------------------------------------------------------------
+
+print("\n" + "=" * 80)
+print("EVALUATION COMPLETED")
+print("=" * 80)
+
+print(
+    f"Saved: {CONFIG['OUT_FILE']}"
+)
+
+
+# -----------------------------------------------------------------------------
+# 27. DOWNLOAD RESULT IN COLAB
+# -----------------------------------------------------------------------------
+
+try:
+
+    from google.colab import files
+
+    files.download(
+        CONFIG["OUT_FILE"]
+    )
+
+except Exception:
+
+    print(
+        "Automatic download unavailable. "
+        "The file is saved in the Colab working directory."
+    )
